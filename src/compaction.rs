@@ -205,6 +205,101 @@ impl Store {
 
         Ok(())
     }
+
+    /// Performs online compaction by scanning existing segments and rewriting
+    /// live records to new segments.
+    pub fn compact_online(&self) -> Result<()> {
+        use crate::transaction::{Durability, Mode, Transaction};
+        use crate::util::now;
+        use vart::VariableSizeKey;
+
+        if self.is_closed.load(Ordering::SeqCst) || !self.core.opts.should_persist_data() {
+            return Err(Error::InvalidOperation);
+        }
+        if self.is_compacting.load(Ordering::SeqCst) {
+            return Err(Error::CompactionAlreadyInProgress);
+        }
+
+        let _guard = CompactionGuard::new(&self.is_compacting);
+        let _commit_lock = self.core.commit_write_lock.lock();
+
+        let index_lock = self.core.indexer.read();
+        let snapshot_version = index_lock.version();
+        let snapshot = index_lock.snapshot();
+        drop(index_lock);
+
+        let retention_threshold = self
+            .core
+            .opts
+            .version_retention_secs
+            .map(|secs| now().saturating_sub(secs));
+
+        let clog_dir = self.core.opts.dir.join("clog");
+        let segments = SegmentRef::read_segments_from_directory(&clog_dir)?;
+
+        for seg in segments {
+            let sr = crate::log::MultiSegmentReader::new(vec![seg])?;
+            let reader = crate::reader::Reader::new_from(sr);
+            let mut rr = crate::reader::RecordReader::new(reader);
+            let mut rec = Record::new();
+            let mut entries = Vec::new();
+
+            loop {
+                rec.reset();
+                match rr.read_into(&mut rec) {
+                    Ok((segment_id, offset)) => {
+                        let key = VariableSizeKey::from_slice(&rec.key);
+                        if let Some((idx_val, _ver, _ts)) = snapshot.get(&key, snapshot_version) {
+                            if idx_val.deleted() {
+                                continue;
+                            }
+
+                            let mut keep = false;
+                            match idx_val {
+                                crate::indexer::IndexValue::Disk(_) => {
+                                    if idx_val.segment_id() == segment_id && idx_val.value_offset() == offset {
+                                        keep = true;
+                                    } else if let Some(th) = retention_threshold {
+                                        if rec.ts >= th {
+                                            keep = true;
+                                        }
+                                    }
+                                }
+                                crate::indexer::IndexValue::Mem(_) => {
+                                    if let Some(th) = retention_threshold {
+                                        if rec.ts >= th {
+                                            keep = true;
+                                        }
+                                    }
+                                }
+                            }
+
+                            if keep {
+                                let mut entry = Entry::new(&rec.key, &rec.value);
+                                entry.set_ts(rec.ts);
+                                if let Some(md) = rec.metadata.clone() {
+                                    entry.set_metadata(md);
+                                }
+                                entry.set_replace(!self.core.opts.enable_versions);
+                                entries.push(entry);
+                            }
+                        }
+                    }
+                    Err(Error::LogError(crate::log::Error::Eof)) => break,
+                    Err(e) => return Err(e),
+                }
+            }
+
+            if !entries.is_empty() {
+                let dummy_txn = Transaction::new(self.core.clone(), Mode::WriteOnly)?;
+                let tx_id = self.core.oracle.new_commit_ts(&dummy_txn)?;
+                self.core
+                    .write_entries(entries, tx_id, Durability::Eventual)?;
+            }
+        }
+
+        Ok(())
+    }
 }
 
 #[derive(Debug, PartialEq)]

@@ -19,7 +19,7 @@ impl IsolationLevel {
     }
 }
 
-#[revisioned(revision = 3)]
+#[revisioned(revision = 4)]
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Options {
     // Required options.
@@ -47,6 +47,10 @@ pub struct Options {
     // Used to enable or disable versioned values.
     #[revision(start = 3)]
     pub enable_versions: bool,
+
+    /// Number of seconds to retain old versions during compaction.
+    #[revision(start = 4)]
+    pub version_retention_secs: Option<u64>,
 }
 
 impl Default for Options {
@@ -61,6 +65,7 @@ impl Default for Options {
             disk_persistence: true,
             max_compaction_segment_size: 1 << 30, // 1 GB
             enable_versions: true,
+            version_retention_secs: None,
         }
     }
 }
@@ -104,5 +109,6 @@ mod tests {
         assert_eq!(options.max_compaction_segment_size, 1 << 30);
         assert!(options.disk_persistence);
         assert!(options.enable_versions);
+        assert!(options.version_retention_secs.is_none());
     }
 }

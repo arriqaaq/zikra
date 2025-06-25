@@ -136,6 +136,13 @@ impl IndexValue {
         }
     }
 
+    pub(crate) fn value_offset(&self) -> u64 {
+        match self {
+            Self::Disk(e) => e.value_offset,
+            Self::Mem(_) => panic!("unavailable for memory index entries"),
+        }
+    }
+
     pub(crate) fn resolve(&self, store: &Core) -> Result<Vec<u8>> {
         match self {
             Self::Mem(mem_entry) => Ok(mem_entry.value.to_vec()),
